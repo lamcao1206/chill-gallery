@@ -11,10 +11,10 @@ import {
 export const authRouter = Router();
 
 const COOKIE_OPTS = {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: isProd,
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  httpOnly: true,
+  sameSite: "lax",
+  secure: false,
+  maxAge: 7 * 24 * 60 * 60 * 1000,
 };
 
 function safeNext(value) {
