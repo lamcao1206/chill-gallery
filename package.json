@@ -5,7 +5,7 @@
   "type": "module",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node src/server.js --env-file=.env",
     "dev": "node --watch src/server.js --env-file=.env",
     "create-user": "node scripts/create-user.js",
     "migrate": "node scripts/migrate-to-s3.js"
