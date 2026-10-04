@@ -1,0 +1,47 @@
+<%- include("_head", { title }) %>
+<body>
+<header class="topbar">
+    <div class="container topbar-inner">
+        <a class="brand" href="/">← Galleries</a>
+        <nav class="nav-actions">
+            <form action="/logout" method="post">
+                <button class="view-btn" type="submit">Log out</button>
+            </form>
+        </nav>
+    </div>
+</header>
+
+<main class="container">
+    <div class="page-heading">
+        <div>
+            <h1>Upload a gallery</h1>
+            <p>Give it a name and pick a .zip of images / videos.</p>
+        </div>
+    </div>
+
+    <% if (error) { %>
+    <div class="form-error"><%= error %></div>
+    <% } %>
+
+    <form class="card-form" action="/upload" method="post" enctype="multipart/form-data">
+        <label class="field">
+            <span>Gallery name</span>
+            <input type="text" name="name" required placeholder="My gallery" autocomplete="off">
+        </label>
+
+        <label class="field">
+            <span>Zip file</span>
+            <input type="file" name="zipfile" accept=".zip,application/zip" required>
+        </label>
+
+        <p class="hint">
+            Only images and videos inside the zip are imported
+            (jpg, png, gif, webp, avif, mp4, webm, mov). Folder structure
+            and other files are ignored. Order follows the file names.
+        </p>
+
+        <button type="submit" class="submit-btn">Upload &amp; create gallery</button>
+    </form>
+</main>
+</body>
+</html>

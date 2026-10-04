@@ -1,0 +1,89 @@
+<%- include("_head", { title }) %>
+<body>
+<header class="topbar">
+    <div class="container topbar-inner">
+        <a class="brand" href="/">Image Galleries</a>
+
+        <form class="search" action="/" method="get">
+            <input
+                type="search"
+                name="q"
+                value="<%= query %>"
+                placeholder="Search galleries..."
+                autocomplete="off"
+            >
+            <button type="submit">Search</button>
+        </form>
+
+        <nav class="nav-actions">
+            <a class="view-btn" href="/upload">+ Upload</a>
+            <form action="/logout" method="post">
+                <button class="view-btn" type="submit">Log out</button>
+            </form>
+        </nav>
+    </div>
+</header>
+
+<main class="container">
+    <div class="page-heading">
+        <div>
+            <h1>Galleries</h1>
+            <p><%= total %> galler<%= total === 1 ? "y" : "ies" %></p>
+        </div>
+
+        <form class="page-size" action="/" method="get">
+            <input type="hidden" name="q" value="<%= query %>">
+            <label>
+                Per page
+                <select name="page_size" onchange="this.form.submit()">
+                    <% [12, 24, 48, 96].forEach(function (size) { %>
+                    <option value="<%= size %>" <%= pageSize === size ? "selected" : "" %>>
+                        <%= size %>
+                    </option>
+                    <% }) %>
+                </select>
+            </label>
+        </form>
+    </div>
+
+    <% if (galleries.length) { %>
+    <section class="gallery-grid">
+        <% galleries.forEach(function (gallery) { %>
+        <a class="gallery-card" href="/gallery/<%= encodeURIComponent(gallery.slug) %>">
+            <% if (gallery.cover) { %>
+            <div class="cover">
+                <img src="<%= gallery.cover %>" alt="<%= gallery.name %>" loading="lazy">
+            </div>
+            <% } else { %>
+            <div class="cover empty">No images</div>
+            <% } %>
+            <div class="card-info">
+                <strong title="<%= gallery.name %>"><%= gallery.name %></strong>
+                <span><%= gallery.count %> image<%= gallery.count === 1 ? "" : "s" %></span>
+            </div>
+        </a>
+        <% }) %>
+    </section>
+    <% } else { %>
+    <div class="empty-state">
+        <h2>No galleries found</h2>
+        <p>Try another search term, or <a href="/upload">upload one</a>.</p>
+    </div>
+    <% } %>
+
+    <% if (totalPages > 1) { %>
+    <nav class="pagination" aria-label="Pagination">
+        <% if (page > 1) { %>
+        <a href="/?q=<%= encodeURIComponent(query) %>&page=<%= page - 1 %>&page_size=<%= pageSize %>">← Previous</a>
+        <% } %>
+
+        <span>Page <%= page %> of <%= totalPages %></span>
+
+        <% if (page < totalPages) { %>
+        <a href="/?q=<%= encodeURIComponent(query) %>&page=<%= page + 1 %>&page_size=<%= pageSize %>">Next →</a>
+        <% } %>
+    </nav>
+    <% } %>
+</main>
+</body>
+</html>

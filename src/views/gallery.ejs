@@ -1,0 +1,51 @@
+<%- include("_head", { title }) %>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <a class="brand" href="/">← Galleries</a>
+      <div class="reader-controls">
+        <button class="view-btn active" data-columns="1">1 / row</button>
+        <button class="view-btn" data-columns="2">2 / row</button>
+        <button class="view-btn" data-columns="3">3 / row</button>
+
+        <select id="page-size" class="view-btn">
+          <option value="24">24 / page</option>
+          <option value="50">50 / page</option>
+          <option value="100">100 / page</option>
+        </select>
+        <div id="reader-pagination" class="reader-pagination"></div>
+
+        <button id="fullscreen-btn" class="view-btn">⛶ Fullscreen</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container reader">
+    <div class="reader-heading">
+      <h1><%= galleryName %></h1>
+      <span><%= images.length %> images</span>
+    </div>
+
+    <% if (images.length) { %>
+    <div id="image-grid" class="image-grid columns-1">
+      <% images.forEach(function (image) { %>
+      <figure class="image-item">
+        <% if (image.type === "video") { %>
+        <video src="<%= image.url %>" autoplay muted loop playsinline controls preload="auto"></video>
+        <% } else { %>
+        <img src="<%= image.url %>" alt="<%= image.name %>" loading="lazy" />
+        <% } %>
+      </figure>
+      <% }) %>
+    </div>
+    <div id="reader-pagination" class="reader-pagination"></div>
+    <% } else { %>
+    <div class="empty-state">
+      <h2>This gallery is empty</h2>
+    </div>
+    <% } %>
+  </main>
+
+  <script src="/gallery.js?v=102"></script>
+</body>
+</html>
