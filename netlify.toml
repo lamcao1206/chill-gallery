@@ -2,6 +2,10 @@
   command = "npm install"
   publish = "public"
 
+[build.environment]
+  # Non-sensitive values that appear throughout the code (e.g. "galleries", "production")
+  SECRETS_SCAN_OMIT_KEYS = "S3_PREFIX,NODE_ENV"
+
 [functions]
   directory = "netlify/functions"
   external_node_modules = ["express"]
