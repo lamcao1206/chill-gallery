@@ -4,6 +4,7 @@
   "description": "Express image/video gallery backed by S3 + Supabase, with JWT auth and zip upload",
   "type": "module",
   "main": "src/server.js",
+  
   "scripts": {
     "start": "node src/server.js --env-file=.env",
     "dev": "node --watch src/server.js --env-file=.env",
@@ -25,6 +26,6 @@
     "unzipper": "^0.12.3"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }
