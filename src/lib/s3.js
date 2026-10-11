@@ -12,7 +12,13 @@ import { contentTypeOf } from "./media.js";
 // Credentials are resolved by the default AWS provider chain:
 // env vars (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY) for local/dev,
 // or the EC2 instance IAM role in production.
-export const s3 = new S3Client({ region: config.s3.region });
+export const s3 = new S3Client({
+  region: config.s3.region,
+  credentials: {
+    accessKeyId: process.env.S3_ACCESS_KEY_ID,
+    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+  },
+});
 
 export function buildKey(...parts) {
     return [config.s3.prefix, ...parts]
