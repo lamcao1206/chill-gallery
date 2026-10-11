@@ -42,7 +42,7 @@ export const config = {
     },
 
     s3: {
-        region: process.env.AWS_REGION || "us-east-1",
+        region: process.env.S3_REGION || "us-east-1",
         bucket: required("S3_BUCKET"),
         prefix: (process.env.S3_PREFIX || "galleries").replace(
             /\/+$/,

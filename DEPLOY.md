@@ -133,12 +133,12 @@ JWT_EXPIRES_IN=7d
 SUPABASE_URL=https://YOUR_PROJECT.supabase.co
 SUPABASE_SECRET_KEY=sb_secret_xxxxxxxxxxxxxxxxxxxx
 
-AWS_REGION=ap-southeast-1
+S3_REGION=ap-southeast-1
 S3_BUCKET=your-gallery-bucket
 S3_PREFIX=galleries
 S3_URL_TTL=3600
 
-# Leave AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY OUT entirely —
+# Leave S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY OUT entirely —
 # the EC2 instance role from step 2 provides credentials automatically.
 ```
 
@@ -159,8 +159,8 @@ chmod 600 .env
 > If you did NOT attach an IAM role in step 2, add these two lines to `.env`
 > instead (less secure — rotate them if leaked):
 > ```env
-> AWS_ACCESS_KEY_ID=AKIA...
-> AWS_SECRET_ACCESS_KEY=...
+> S3_ACCESS_KEY_ID=AKIA...
+> S3_SECRET_ACCESS_KEY=...
 > ```
 
 ---
@@ -205,7 +205,7 @@ the bucket:
 LOCAL_IMAGE_ROOT=../images npm run migrate
 ```
 
-(On the laptop you need `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` in `.env`,
+(On the laptop you need `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` in `.env`,
 since the laptop has no instance role.)
 
 ---

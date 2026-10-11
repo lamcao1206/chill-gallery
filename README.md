@@ -74,7 +74,7 @@ Example policy (replace `your-gallery-bucket`):
 
 ```bash
 cp .env.example .env
-# then fill in JWT_SECRET, SUPABASE_*, S3_*, AWS_* …
+# then fill in JWT_SECRET, SUPABASE_*, S3_*, S3_* …
 ```
 
 Generate a strong `JWT_SECRET`:
@@ -136,8 +136,8 @@ Two common options:
 ### A. Docker (recommended)
 
 1. Launch an EC2 instance (Amazon Linux 2023 / Ubuntu). Attach an **IAM role**
-   granting the S3 permissions above — then you can leave `AWS_ACCESS_KEY_ID` /
-   `AWS_SECRET_ACCESS_KEY` blank in `.env`.
+   granting the S3 permissions above — then you can leave `S3_ACCESS_KEY_ID` /
+   `S3_SECRET_ACCESS_KEY` blank in `.env`.
 2. Open inbound port 80/443 (and 8000 if testing directly) in the security group.
 3. Install Docker, copy this folder up (or `git clone`), create `.env`, then:
 
