@@ -3,13 +3,18 @@
   publish = "public"
 
 [build.environment]
-  # Non-sensitive values that appear throughout the code (e.g. "galleries", "production")
-  SECRETS_SCAN_OMIT_KEYS = "S3_PREFIX,NODE_ENV"
+  # Non-sensitive config values that legitimately appear in code, docs and
+  # dependencies (e.g. "galleries", "production", "7d", a port, a region,
+  # a TTL, a local path). Real secrets (JWT_SECRET, S3/Supabase keys) are
+  # still scanned.
+  SECRETS_SCAN_OMIT_KEYS = "S3_PREFIX,NODE_ENV,JWT_EXPIRES_IN,PORT,S3_REGION,S3_URL_TTL,LOCAL_IMAGE_ROOT"
 
 [functions]
   directory = "netlify/functions"
-  external_node_modules = ["express"]
+  external_node_modules = ["express", "ejs"]
   node_bundler = "esbuild"
+  # EJS templates are read from disk at runtime, so ship them with the bundle.
+  included_files = ["src/views/**", "public/**"]
 
 [[redirects]]
   from = "/api/*"

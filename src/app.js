@@ -1,6 +1,5 @@
 // src/app.js
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import express from "express";
 import cookieParser from "cookie-parser";
@@ -12,7 +11,10 @@ import { galleryRouter } from "./routes/gallery.js";
 import { uploadRouter } from "./routes/upload.js";
 import { settingsRouter } from "./routes/settings.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// Resolve from the project root rather than import.meta.url: the Netlify
+// function bundle is CJS (import.meta is empty there) and views/public are
+// shipped alongside it via `included_files`.
+const rootDir = process.cwd();
 
 const app = express();
 
@@ -21,8 +23,8 @@ if (isProd) {
 }
 
 app.set("view engine", "ejs");
-app.set("views", path.join(__dirname, "views"));
-app.use(express.static(path.join(__dirname, "..", "public")));
+app.set("views", path.join(rootDir, "src", "views"));
+app.use(express.static(path.join(rootDir, "public")));
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
