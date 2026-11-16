@@ -1,7 +1,7 @@
-// src/server.js
+// src/worker.js
+import { httpServerHandler } from "cloudflare:node";
 import app from "./app.js";
-import { config } from "./config.js";
 
-app.listen(config.port, () => {
-  console.log(`Image gallery listening on port ${config.port}`);
-});
+app.listen(3000);
+
+export default httpServerHandler({ port: 3000 });

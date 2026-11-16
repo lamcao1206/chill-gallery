@@ -1,27 +1,36 @@
 #!/usr/bin/env node
-
 /**
- * Migrate the existing local image galleries into S3 + Supabase.
+ * Install as scripts/migrate-to-s3.js (same imports as the original).
+ * Run ONLY ONE migration process, with no concurrent gallery edits.
  *
- * Safe to re-run:
- * - Existing completed galleries are skipped.
- * - Incomplete galleries are detected and repaired.
- * - Stopping the script with Ctrl+C is safe.
+ * LOCAL_IMAGE_ROOT=../images MIGRATE_CONCURRENCY=4 node scripts/migrate-to-s3.js
+ * MIGRATE_BATCH_SIZE=50      Upload + commit this many files at a time (1..500).
+ * MIGRATE_ATTEMPTS=4         Total attempts per transient failure (1..10).
+ * MIGRATE_OWNER_EMAIL=...    Optional owner for NEW galleries only.
+ * MIGRATE_REUPLOAD=1         Re-upload matching DB files, e.g. changed local content.
  *
- * Usage:
- *   LOCAL_IMAGE_ROOT=../images node scripts/migrate-to-s3.js
+ * No schema changes or new packages required. Does not delete rows or S3 objects.
+ * Existing DB rows are trusted to refer to uploaded S3 objects. This is not an
+ * integrity audit: enable MIGRATE_REUPLOAD to restore missing/changed objects.
+ * Keys retain the original index-based format. Removed/reordered/renamed files
+ * can produce unexpected old rows; stop and reconcile those explicitly.
  *
- * Optional:
- *   MIGRATE_OWNER_EMAIL=someone@example.com
+ * Uses uploadBuffer because the supplied S3 helper only exposes that interface.
+ * Memory includes up to CONCURRENCY full files plus SDK overhead; for large
+ * videos use concurrency=1 or extend the helper with streaming/multipart upload.
+ * Configure network timeouts in your Supabase/S3 clients; this wrapper cannot
+ * cancel a hung helper. SDK retries may compound these outer retries.
+ * Ctrl+C/SIGTERM: finish in-flight files, commit successes, then stop.
+ * A forced kill can require re-uploading the current uncommitted batch.
  */
 
-import fs from "node:fs";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { config } from "../src/config.js";
 import { supabase } from "../src/db/supabase.js";
 import { buildKey, uploadBuffer } from "../src/lib/s3.js";
-
 import {
     isMedia,
     mediaType,
@@ -29,379 +38,549 @@ import {
     slugify,
 } from "../src/lib/media.js";
 
-const LOCAL_IMAGE_ROOT = path.resolve(
-    process.env.LOCAL_IMAGE_ROOT || "../images"
-);
+const ROOT = path.resolve(process.env.LOCAL_IMAGE_ROOT || "../images");
 
-// Optional: attribute migrated galleries to a user.
-const OWNER_EMAIL = process.env.MIGRATE_OWNER_EMAIL || "";
+const OWNER_EMAIL = (process.env.MIGRATE_OWNER_EMAIL || "")
+    .trim()
+    .toLowerCase();
 
-/**
- * List gallery directories.
- */
-function listGalleryDirs(root) {
-    return fs
-        .readdirSync(root, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => entry.name)
-        .sort(naturalCompare);
-}
+function integer(name, fallback, max) {
+    const value = Number(process.env[name] ?? fallback);
 
-/**
- * List media files inside a gallery.
- */
-function listMediaFiles(dir) {
-    return fs
-        .readdirSync(dir, { withFileTypes: true })
-        .filter(
-            (entry) =>
-                entry.isFile() &&
-                isMedia(entry.name)
-        )
-        .map((entry) => entry.name)
-        .sort(naturalCompare);
-}
-
-/**
- * Resolve optional owner.
- */
-async function resolveOwnerId() {
-    if (!OWNER_EMAIL) {
-        return null;
+    if (!Number.isInteger(value) || value < 1 || value > max) {
+        throw new Error(
+            `${name} must be an integer between 1 and ${max}`
+        );
     }
 
-    const { data, error } = await supabase
-        .from("users")
-        .select("id")
-        .eq("email", OWNER_EMAIL.toLowerCase())
-        .maybeSingle();
+    return value;
+}
 
-    if (error) {
-        throw error;
-    }
+const CONCURRENCY = integer("MIGRATE_CONCURRENCY", 4, 32);
+const BATCH_SIZE = integer("MIGRATE_BATCH_SIZE", 50, 500);
+const ATTEMPTS = integer("MIGRATE_ATTEMPTS", 4, 10);
+const REUPLOAD = process.env.MIGRATE_REUPLOAD === "1";
 
-    if (!data) {
+let stopping = false;
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, () => {
+        stopping = true;
+        process.exitCode = signal === "SIGINT" ? 130 : 143;
+
         console.warn(
-            `! MIGRATE_OWNER_EMAIL "${OWNER_EMAIL}" not found; created_by will be null.`
+            `\n${signal}: finishing in-flight uploads and saving progress...`
+        );
+    });
+}
+
+function transient(error) {
+    const status = Number(
+        error.status ??
+        error.statusCode ??
+        error.$metadata?.httpStatusCode
+    );
+
+    if ([408, 429, 500, 502, 503, 504].includes(status)) {
+        return true;
+    }
+
+    const code = error.code || error.cause?.code || error.name;
+
+    return (
+        [
+            "ECONNRESET",
+            "ETIMEDOUT",
+            "EAI_AGAIN",
+            "ECONNREFUSED",
+            "UND_ERR_CONNECT_TIMEOUT",
+            "UND_ERR_SOCKET",
+            "TimeoutError",
+            "NetworkingError",
+            "SlowDown",
+            "RequestTimeout",
+            "40001",
+            "40P01",
+            "53300",
+            "57P01",
+        ].includes(code) ||
+        /fetch failed|network error/i.test(error.message || "")
+    );
+}
+
+async function retry(label, operation) {
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await operation();
+        } catch (error) {
+            if (attempt >= ATTEMPTS || !transient(error)) {
+                throw error;
+            }
+
+            const ms = Math.round(
+                Math.random() *
+                Math.min(15_000, 500 * 2 ** (attempt - 1))
+            );
+
+            console.warn(
+                `  ${label}: retry ${attempt}/${ATTEMPTS - 1} in ${ms}ms`
+            );
+
+            await delay(ms);
+        }
+    }
+}
+
+// Rebuild the query for each attempt; preserve HTTP status for classification.
+async function query(factory) {
+    const result = await factory();
+
+    if (result.error) {
+        const error = new Error(
+            result.error.message || "Supabase request failed"
         );
 
-        return null;
-    }
+        Object.assign(error, result.error, {
+            status: result.status,
+        });
 
-    return data.id;
-}
-
-/**
- * Find an existing gallery.
- *
- * Returns the gallery row instead of only true/false.
- */
-async function findGallery(name) {
-    const { data, error } = await supabase
-        .from("galleries")
-        .select("id, name, slug, image_count, cover_key")
-        .eq("name", name)
-        .maybeSingle();
-
-    if (error) {
         throw error;
     }
+
+    return result;
+}
+
+const db = (label, factory) =>
+    retry(label, () => query(factory));
+
+async function listNames(dir, predicate) {
+    return (await readdir(dir, { withFileTypes: true }))
+        .filter(predicate)
+        .map((entry) => entry.name)
+        .sort(naturalCompare);
+}
+
+async function findGallery(name) {
+    const { data } = await db("find gallery", () =>
+        supabase
+            .from("galleries")
+            .select("id,name,slug,image_count,cover_key")
+            .eq("name", name)
+            .maybeSingle()
+    );
 
     return data;
 }
 
-/**
- * Get the number of images currently stored for a gallery.
- */
-async function getGalleryImageCount(galleryId) {
-    const { count, error } = await supabase
-        .from("images")
-        .select("id", {
-            count: "exact",
-            head: true,
-        })
-        .eq("gallery_id", galleryId);
+async function imageRows(galleryId) {
+    const rows = [];
 
-    if (error) {
-        throw error;
-    }
+    // Continue until empty rather than assuming a short page means EOF.
+    // The server may apply a smaller row limit than the requested page size.
+    for (let offset = 0; ; ) {
+        const { data } = await db("list images", () =>
+            supabase
+                .from("images")
+                .select("id,s3_key,filename,media_type,position")
+                .eq("gallery_id", galleryId)
+                .order("id")
+                .range(offset, offset + 199)
+        );
 
-    return count ?? 0;
-}
+        if (!data?.length) {
+            return rows;
+        }
 
-/**
- * Delete existing image records for an incomplete gallery.
- *
- * We keep the gallery itself and rebuild its image records.
- */
-async function deleteGalleryImages(galleryId) {
-    const { error } = await supabase
-        .from("images")
-        .delete()
-        .eq("gallery_id", galleryId);
-
-    if (error) {
-        throw error;
+        rows.push(...data);
+        offset += data.length;
     }
 }
 
-/**
- * Migrate one gallery.
- */
-async function migrateGallery(name, ownerId) {
-    const dir = path.join(LOCAL_IMAGE_ROOT, name);
+async function ensureGallery(name, slug, ownerId) {
+    // Re-read before retrying an insert: the previous request may have
+    // committed while its response was lost.
+    // Requires a single migration writer.
+    return retry("create gallery", async () => {
+        const existing = await findGallery(name);
 
-    const files = listMediaFiles(dir);
-
-    if (files.length === 0) {
-        console.log(`- ${name}: no media, skipped`);
-        return;
-    }
-
-    /*
-     * ------------------------------------------------------------
-     * 1. CHECK DATABASE BEFORE UPLOADING ANYTHING
-     * ------------------------------------------------------------
-     */
-
-    const existingGallery = await findGallery(name);
-
-    if (existingGallery) {
-        const dbImageCount = await getGalleryImageCount(
-            existingGallery.id
-        );
-
-        console.log(
-            `- ${name}: found in DB (${dbImageCount}/${files.length} images)`
-        );
-
-        /*
-         * Everything is already there.
-         *
-         * Skip this gallery completely.
-         */
-        if (
-            dbImageCount === files.length &&
-            existingGallery.image_count === files.length
-        ) {
-            console.log(`  ✓ already complete, skipped`);
-            return;
+        if (existing) {
+            return existing;
         }
 
-        /*
-         * Gallery exists but image count doesn't match.
-         *
-         * This usually means the previous migration was interrupted.
-         */
-        console.log(
-            `  ! incomplete gallery detected, repairing...`
-        );
-
-        await deleteGalleryImages(existingGallery.id);
-
-        /*
-         * Continue below and upload/rebuild the images.
-         */
-    }
-
-    /*
-     * ------------------------------------------------------------
-     * 2. UPLOAD FILES TO S3
-     * ------------------------------------------------------------
-     */
-
-    const slug = existingGallery?.slug || slugify(name);
-
-    const imageRows = [];
-    let coverKey = existingGallery?.cover_key || null;
-
-    for (let i = 0; i < files.length; i++) {
-        const filename = files[i];
-
-        const prefix = String(i).padStart(4, "0");
-
-        const key = buildKey(
-            slug,
-            `${prefix}-${filename}`
-        );
-
-        const filePath = path.join(dir, filename);
-
-        const buffer = fs.readFileSync(filePath);
-
-        await uploadBuffer(
-            key,
-            buffer,
-            filename
-        );
-
-        if (!coverKey) {
-            coverKey = key;
-        }
-
-        imageRows.push({
-            s3_key: key,
-            filename,
-            media_type: mediaType(filename),
-            position: i,
-        });
-
-        process.stdout.write(
-            `\r  ${name}: uploaded ${i + 1}/${files.length}   `
-        );
-    }
-
-    process.stdout.write("\n");
-
-    /*
-     * ------------------------------------------------------------
-     * 3. CREATE OR UPDATE GALLERY
-     * ------------------------------------------------------------
-     */
-
-    let galleryId;
-
-    if (existingGallery) {
-        /*
-         * Gallery already exists.
-         *
-         * Update its metadata instead of inserting another row.
-         */
-        const { data: gallery, error } = await supabase
-            .from("galleries")
-            .update({
-                slug,
-                cover_key: coverKey,
-                image_count: imageRows.length,
-                created_by: ownerId,
-            })
-            .eq("id", existingGallery.id)
-            .select()
-            .single();
-
-        if (error) {
-            throw error;
-        }
-
-        galleryId = gallery.id;
-
-        console.log(
-            `  ✓ gallery repaired: ${name}`
-        );
-    } else {
-        /*
-         * Brand new gallery.
-         */
-        const { data: gallery, error: galleryError } =
-            await supabase
+        const { data } = await query(() =>
+            supabase
                 .from("galleries")
                 .insert({
                     name,
                     slug,
-                    cover_key: coverKey,
-                    image_count: imageRows.length,
                     created_by: ownerId,
+                    image_count: 0,
+                    cover_key: null,
                 })
-                .select()
-                .single();
-
-        if (galleryError) {
-            throw galleryError;
-        }
-
-        galleryId = gallery.id;
-    }
-
-    /*
-     * ------------------------------------------------------------
-     * 4. INSERT IMAGE RECORDS
-     * ------------------------------------------------------------
-     */
-
-    const { error: imagesError } = await supabase
-        .from("images")
-        .insert(
-            imageRows.map((row) => ({
-                ...row,
-                gallery_id: galleryId,
-            }))
+                .select("id,name,slug,image_count,cover_key")
+                .single()
         );
 
-    if (imagesError) {
-        throw imagesError;
-    }
-
-    console.log(
-        `✓ ${name}: ${imageRows.length} items`
-    );
+        return data;
+    });
 }
 
-/**
- * Main migration.
- */
-async function main() {
-    /*
-     * Check source directory.
-     */
-    if (!fs.existsSync(LOCAL_IMAGE_ROOT)) {
-        console.error(
-            `Image root not found: ${LOCAL_IMAGE_ROOT}`
-        );
-
-        process.exit(1);
-    }
-
-    console.log(`Source : ${LOCAL_IMAGE_ROOT}`);
-    console.log(
-        `Bucket : ${config.s3.bucket} (prefix "${config.s3.prefix}")`
-    );
-
-    console.log("");
-
-    /*
-     * Resolve owner.
-     */
-    const ownerId = await resolveOwnerId();
-
-    /*
-     * Find galleries.
-     */
-    const dirs = listGalleryDirs(
-        LOCAL_IMAGE_ROOT
-    );
-
-    if (dirs.length === 0) {
-        console.log(
-            "No gallery sub-directories found. Nothing to do."
-        );
-
+async function saveRows(galleryId, rows) {
+    if (!rows.length) {
         return;
     }
 
-    console.log(
-        `Found ${dirs.length} gallery directories.\n`
+    // No upsert conflict target is assumed. Reconcile uncertain insert
+    // outcomes before retrying so a lost response does not duplicate
+    // an accepted batch.
+    let uncertain = false;
+
+    await retry("insert images", async () => {
+        let missing = rows;
+
+        if (uncertain) {
+            const existing = new Set(
+                (await imageRows(galleryId)).map((row) => row.s3_key)
+            );
+
+            missing = rows.filter(
+                (row) => !existing.has(row.s3_key)
+            );
+        }
+
+        if (!missing.length) {
+            return;
+        }
+
+        try {
+            await query(() =>
+                supabase.from("images").insert(
+                    missing.map((row) => ({
+                        ...row,
+                        gallery_id: galleryId,
+                    }))
+                )
+            );
+        } catch (error) {
+            uncertain = true;
+            throw error;
+        }
+    });
+}
+
+async function uploadBatch(rows, dir, progress) {
+    const uploaded = [];
+    const errors = [];
+
+    let cursor = 0;
+
+    await Promise.all(
+        Array.from(
+            { length: Math.min(CONCURRENCY, rows.length) },
+            async () => {
+                while (
+                    !stopping &&
+                    errors.length === 0 &&
+                    cursor < rows.length
+                ) {
+                    const row = rows[cursor++];
+
+                    try {
+                        // Async reads, with only one buffer per active worker.
+                        const buffer = await readFile(
+                            path.join(dir, row.filename)
+                        );
+
+                        await retry(
+                            `upload ${row.filename}`,
+                            () =>
+                                uploadBuffer(
+                                    row.s3_key,
+                                    buffer,
+                                    row.filename
+                                )
+                        );
+
+                        uploaded.push(row);
+                        progress();
+                    } catch (error) {
+                        errors.push(
+                            new Error(
+                                `${row.filename}: ${error.message}`,
+                                { cause: error }
+                            )
+                        );
+                    }
+                }
+            }
+        )
     );
 
-    /*
-     * Process sequentially.
-     */
-    for (const name of dirs) {
-        try {
-            await migrateGallery(
-                name,
-                ownerId
-            );
-        } catch (err) {
-            console.error(
-                `✗ ${name}: ${err.message}`
+    // All workers settle before the caller saves successes or moves on.
+    return { uploaded, errors };
+}
+
+async function migrateGallery(name, ownerId) {
+    const dir = path.join(ROOT, name);
+
+    const files = await listNames(
+        dir,
+        (entry) => entry.isFile() && isMedia(entry.name)
+    );
+
+    if (!files.length) {
+        console.log(`- ${name}: no media`);
+        return "skipped";
+    }
+
+    let gallery = await findGallery(name);
+
+    const slug = gallery?.slug || slugify(name);
+
+    if (!slug) {
+        throw new Error(
+            "Empty gallery slug; rename the local directory"
+        );
+    }
+
+    const { data: collision } = await db("check slug", () =>
+        supabase
+            .from("galleries")
+            .select("id,name")
+            .eq("slug", slug)
+            .maybeSingle()
+    );
+
+    if (collision && collision.id !== gallery?.id) {
+        throw new Error(
+            `Slug ${slug} already belongs to ${collision.name}; resolve before uploading`
+        );
+    }
+
+    const expected = files.map((filename, position) => ({
+        s3_key: buildKey(
+            slug,
+            `${String(position).padStart(4, "0")}-${filename}`
+        ),
+        filename,
+        media_type: mediaType(filename),
+        position,
+    }));
+
+    const expectedKeys = new Set(
+        expected.map((row) => row.s3_key)
+    );
+
+    if (expectedKeys.size !== expected.length) {
+        throw new Error("S3 key collision in local file list");
+    }
+
+    const existing = gallery
+        ? await imageRows(gallery.id)
+        : [];
+
+    const byKey = new Map(
+        existing.map((row) => [row.s3_key, row])
+    );
+
+    if (
+        existing.length !== byKey.size ||
+        existing.some((row) => !expectedKeys.has(row.s3_key))
+    ) {
+        throw new Error(
+            "Duplicate or unexpected DB image keys; reconcile manually (nothing deleted)"
+        );
+    }
+
+    // Catch mismatched metadata instead of accepting equal counts.
+    for (const row of expected) {
+        const old = byKey.get(row.s3_key);
+
+        if (
+            old &&
+            (
+                old.filename !== row.filename ||
+                old.position !== row.position ||
+                old.media_type !== row.media_type
+            )
+        ) {
+            throw new Error(
+                `DB metadata mismatch for ${row.filename}; reconcile manually`
             );
         }
     }
 
-    console.log("\nDone.");
+    if (stopping) {
+        return "interrupted";
+    }
+
+    gallery ||= await ensureGallery(name, slug, ownerId);
+
+    const pending = expected.filter(
+        (row) => REUPLOAD || !byKey.has(row.s3_key)
+    );
+
+    let done = expected.length - pending.length;
+
+    console.log(
+        `- ${name}: ${done}/${expected.length} already recorded; ${pending.length} to upload`
+    );
+
+    for (
+        let offset = 0;
+        offset < pending.length && !stopping;
+        offset += BATCH_SIZE
+    ) {
+        const batch = pending.slice(
+            offset,
+            offset + BATCH_SIZE
+        );
+
+        const { uploaded, errors } = await uploadBatch(
+            batch,
+            dir,
+            () => {
+                done++;
+
+                if (process.stdout.isTTY) {
+                    process.stdout.write(
+                        `\r  ${name}: ${done}/${expected.length}   `
+                    );
+                }
+            }
+        );
+
+        if (process.stdout.isTTY) {
+            process.stdout.write("\n");
+        }
+
+        await saveRows(
+            gallery.id,
+            uploaded.filter((row) => !byKey.has(row.s3_key))
+        );
+
+        if (!process.stdout.isTTY) {
+            console.log(
+                `  ${name}: ${done}/${expected.length} uploaded or resumed`
+            );
+        }
+
+        if (errors.length) {
+            throw new AggregateError(
+                errors,
+                errors.map((error) => error.message).join("; ")
+            );
+        }
+    }
+
+    if (stopping) {
+        return "interrupted";
+    }
+
+    const stored = await imageRows(gallery.id);
+
+    if (
+        stored.length !== expected.length ||
+        new Set(stored.map((row) => row.s3_key)).size !==
+            expected.length ||
+        stored.some((row) => !expectedKeys.has(row.s3_key))
+    ) {
+        throw new Error("Final DB verification failed");
+    }
+
+    // Publish completion last.
+    // Preserve an existing valid cover and ownership.
+    const coverKey = expectedKeys.has(gallery.cover_key)
+        ? gallery.cover_key
+        : expected[0].s3_key;
+
+    await db("finalize gallery", () =>
+        supabase
+            .from("galleries")
+            .update({
+                image_count: expected.length,
+                cover_key: coverKey,
+            })
+            .eq("id", gallery.id)
+            .select("id")
+            .single()
+    );
+
+    console.log(`✓ ${name}: ${expected.length} items`);
+
+    return pending.length ? "migrated" : "skipped";
 }
 
-main().catch((err) => {
-    console.error(err);
-    process.exit(1);
+async function main() {
+    const dirs = await listNames(
+        ROOT,
+        (entry) => entry.isDirectory()
+    );
+
+    console.log(
+        `Source: ${ROOT}\nBucket: ${config.s3.bucket} (prefix "${config.s3.prefix}")`
+    );
+
+    console.log(
+        `Galleries: ${dirs.length}; upload workers: ${CONCURRENCY}; batch size: ${BATCH_SIZE}`
+    );
+
+    let ownerId = null;
+
+    if (OWNER_EMAIL) {
+        const { data } = await db("resolve owner", () =>
+            supabase
+                .from("users")
+                .select("id")
+                .eq("email", OWNER_EMAIL)
+                .maybeSingle()
+        );
+
+        if (!data) {
+            throw new Error(
+                `Owner ${OWNER_EMAIL} not found; correct MIGRATE_OWNER_EMAIL`
+            );
+        }
+
+        ownerId = data.id;
+    }
+
+    const started = Date.now();
+
+    const counts = {
+        migrated: 0,
+        skipped: 0,
+        failed: 0,
+        interrupted: 0,
+    };
+
+    for (const name of dirs) {
+        if (stopping) {
+            break;
+        }
+
+        try {
+            const result = await migrateGallery(name, ownerId);
+            counts[result]++;
+        } catch (error) {
+            counts.failed++;
+            console.error(`✗ ${name}: ${error.message}`);
+        }
+    }
+
+    console.log(
+        `\n${stopping ? "Stopped" : "Finished"}: ${JSON.stringify(counts)} in ${((Date.now() - started) / 1000).toFixed(1)}s`
+    );
+
+    if (counts.failed && !process.exitCode) {
+        process.exitCode = 1;
+    }
+}
+
+main().catch((error) => {
+    console.error(error.message);
+
+    if (!process.exitCode) {
+        process.exitCode = 1;
+    }
 });
